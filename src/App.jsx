@@ -2,7 +2,6 @@ import { useState, useEffect, useRef } from 'react';
 import './index.css'; 
 
 function App() {
-  const [detectedStudents, setDetectedStudents] = useState({});
   const dbRef = useRef(null);
   
   // AI 및 센서 관련 변수
@@ -11,7 +10,6 @@ function App() {
   
   // 로직 상태 변수
   const [isRunning, setIsRunning] = useState(false);
-  const [audioState, setAudioState] = useState({ label: 'Standby', active: false });
   const lastKoreanTime = useRef(0);
   const lastMouthTime = useRef(0);
   const lastTriggerTime = useRef(0);
@@ -35,7 +33,7 @@ function App() {
     }
   }, []);
 
-  // [2] 시스템 시작 (AI 로드 -> 오디오 -> 비디오)
+  // [2] 시스템 시작
   const startSystem = async () => {
     const name = document.getElementById('input-name').value;
     const id = document.getElementById('input-id').value;
@@ -43,8 +41,10 @@ function App() {
 
     const btn = document.getElementById('btn-start');
     const msg = document.getElementById('loading-msg');
+    
+    // UI 업데이트 (HTML 원본 동작 모방)
     if(btn) btn.disabled = true;
-    if(msg) { msg.style.display = 'block'; msg.innerText = "Initializing AI..."; }
+    if(msg) { msg.style.display = 'block'; msg.innerText = "Step 1: Requesting AI Model..."; }
 
     try {
       // (1) Edge Impulse AI 로드
@@ -52,16 +52,20 @@ function App() {
       await classifier.init();
       classifierRef.current = classifier;
 
-      // (2) 오디오 시작 (기존 WebSpeech 대신 Edge Impulse 사용)
-      await startAudioProcessing();
-
-      // (3) 비디오 시작 (FaceMesh)
+      // (2) 비디오 시작 (FaceMesh)
+      if(msg) msg.innerText = "Step 2: Requesting Camera...";
       await startFaceMesh();
 
-      // UI 업데이트
+      // (3) 오디오 시작 (Edge Impulse Logic)
+      if(msg) msg.innerText = "Step 3: Requesting Microphone...";
+      await startAudioProcessing();
+
+      // 최종 UI 전환
       if(msg) msg.style.display = 'none';
       if(btn) btn.style.display = 'none';
       document.getElementById('btn-stop').style.display = 'block';
+      
+      // 메인 화면 전환
       document.getElementById('placeholder').style.display = 'none';
       document.getElementById('camera-wrapper').style.display = 'block';
       document.getElementById('status-panel').style.display = 'flex';
@@ -75,33 +79,20 @@ function App() {
     }
   };
 
-  // [3] 오디오 처리 (깃허브 로직 이식)
-  const downsampleBuffer = (buffer, sampleRate, outSampleRate) => {
-    if (outSampleRate === sampleRate) return buffer;
-    let sampleRateRatio = sampleRate / outSampleRate;
-    let newLength = Math.round(buffer.length / sampleRateRatio);
-    let result = new Float32Array(newLength);
-    let offsetResult = 0; let offsetBuffer = 0;
-    while (offsetResult < result.length) {
-      let nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
-      let accum = 0, count = 0;
-      for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) { accum += buffer[i]; count++; }
-      result[offsetResult] = accum / count; offsetResult++; offsetBuffer = nextOffsetBuffer;
-    }
-    return result;
-  };
-
+  // [3] 오디오 처리 (수정된 GitHub 로직)
   const startAudioProcessing = async () => {
     const AudioContext = window.AudioContext || window.webkitAudioContext;
     const ctx = new AudioContext();
     audioCtxRef.current = ctx;
+    
+    // 브라우저 정책상 Resume 필수
     if (ctx.state === 'suspended') await ctx.resume();
 
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const source = ctx.createMediaStreamSource(stream);
     const processor = ctx.createScriptProcessor(4096, 1, 1);
     
-    // 버퍼 설정
+    // Edge Impulse는 16kHz 데이터를 원함
     const targetRate = 16000;
     const bufferSize = 16000; 
     let circularBuffer = new Float32Array(bufferSize);
@@ -114,8 +105,28 @@ function App() {
       if (!classifierRef.current) return;
 
       const inputData = e.inputBuffer.getChannelData(0);
-      const downsampled = downsampleBuffer(inputData, ctx.sampleRate, targetRate);
+      
+      // 다운샘플링 로직 (소리가 인식되도록 수정됨)
+      let outputSampleRate = targetRate;
+      let sampleRateRatio = ctx.sampleRate / outputSampleRate;
+      let newLength = Math.round(inputData.length / sampleRateRatio);
+      let downsampled = new Float32Array(newLength);
+      let offsetResult = 0;
+      let offsetBuffer = 0;
+      
+      while (offsetResult < downsampled.length) {
+        let nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+        let accum = 0, count = 0;
+        for (let i = offsetBuffer; i < nextOffsetBuffer && i < inputData.length; i++) {
+            accum += inputData[i];
+            count++;
+        }
+        downsampled[offsetResult] = accum / count;
+        offsetResult++;
+        offsetBuffer = nextOffsetBuffer;
+      }
 
+      // 원형 버퍼에 채우기
       for (let i = 0; i < downsampled.length; i++) {
         circularBuffer[writeIndex] = downsampled[i];
         writeIndex = (writeIndex + 1) % bufferSize;
@@ -129,29 +140,33 @@ function App() {
 
       try {
         let results = classifierRef.current.classify(linearBuffer);
+        // 가장 높은 점수 찾기
         let top = results.results.reduce((p, c) => p.value > c.value ? p : c);
         
-        // 결과 처리 (Korean 감지 시)
+        // 결과 처리 (사용자님 텍스트 포맷 적용)
         const statusEl = document.getElementById('status-audio');
-        if (top.label === 'korean' && top.value > 0.5) {
-             lastKoreanTime.current = Date.now();
-             if(statusEl) {
+        if (statusEl) {
+            // 'korean' 클래스가 0.5 (50%) 이상일 때 감지
+            if (top.label === 'korean' && top.value > 0.5) {
+                 lastKoreanTime.current = Date.now();
                  statusEl.innerText = "🔊 Korean Detected!";
                  statusEl.className = "status-box active-red";
-             }
-             checkViolation();
-        } else {
-             // 1.5초 지나면 상태 복구
-             if (Date.now() - lastKoreanTime.current > 1500 && statusEl) {
-                 statusEl.innerText = "🎤 Silence/English";
-                 statusEl.className = "status-box";
-             }
+                 checkViolation();
+            } else {
+                 // 1.5초 동안 조용하면 Standby로 복귀
+                 if (Date.now() - lastKoreanTime.current > 1500) {
+                     statusEl.innerText = "🎤 Silence/English";
+                     statusEl.className = "status-box";
+                 }
+            }
         }
-      } catch (ex) {}
+      } catch (ex) {
+          // 분류 에러 무시
+      }
     };
   };
 
-  // [4] 비디오 처리 (FaceMesh - 사용자님 로직 유지)
+  // [4] 비디오 처리 (FaceMesh - 사용자님 코드 로직 + React State 연결)
   const startFaceMesh = async () => {
     const videoElement = document.getElementById('input_video');
     const canvasElement = document.getElementById('output_canvas');
@@ -161,6 +176,7 @@ function App() {
     faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5 });
     
     faceMesh.onResults((results) => {
+      // 캔버스 초기화
       canvasElement.width = 500; canvasElement.height = 500;
       ctx.fillStyle = "black"; ctx.fillRect(0, 0, 500, 500);
 
@@ -192,6 +208,7 @@ function App() {
               }
           }
 
+          // 줌 기능 (사용자님 공식)
           const zoom = 4.0; const cw = sW/zoom; const ch = sH/zoom;
           let cx = ((upper.x + lower.x)/2 * sW) - cw/2;
           let cy = ((upper.y + lower.y)/2 * sH) - ch/2;
@@ -209,7 +226,7 @@ function App() {
   // [5] 위반 감지 (로직 통합)
   const checkViolation = () => {
     const now = Date.now();
-    if (now - lastTriggerTime.current < 5000) return; // 쿨다운
+    if (now - lastTriggerTime.current < 5000) return; // 5초 쿨다운
 
     const isKoreanRecent = (now - lastKoreanTime.current < 3000);
     const isMouthRecent = (now - lastMouthTime.current < 3000);
@@ -222,19 +239,19 @@ function App() {
   const triggerDetection = () => {
     lastTriggerTime.current = Date.now(); 
 
-    // 오버레이
+    // 1. 오버레이 표시
     const overlay = document.getElementById('alert-overlay');
     if(overlay) {
         overlay.style.display = 'block';
         overlay.innerText = `🚨 DETECTED!`;
+        // 상태창 강제 레드
+        const sv = document.getElementById('status-video');
+        if(sv) sv.className = "status-box active-red";
+        
         setTimeout(() => overlay.style.display = 'none', 2000);
     }
-    
-    // 상태창 빨간불
-    const sv = document.getElementById('status-video');
-    if(sv) sv.className = "status-box active-red";
 
-    // 이미지 변경
+    // 2. 이미지 변경 (사용자님 코드 로직)
     const img = document.getElementById('monitor-image');
     if(img) {
         img.src = "2.jpg"; 
@@ -247,7 +264,7 @@ function App() {
         }, 5000);
     }
 
-    // DB 전송
+    // 3. DB 전송
     const name = document.getElementById('input-name').value;
     const id = document.getElementById('input-id').value;
     if(dbRef.current) {
@@ -258,22 +275,7 @@ function App() {
     }
   };
 
-  // [6] 기타 UI 기능들
-  const toggleList = () => {
-      document.getElementById('list-panel').classList.toggle('open');
-  };
-
-  const authProfessor = () => {
-    if (prompt("Enter Admin Password:") === "kyj") {
-        alert("✅ Admin Mode Activated");
-        document.getElementById('prof-controls').style.display = 'block';
-        document.getElementById('btn-prof').style.display = 'none';
-        loadList(); 
-    } else {
-        alert("❌ Wrong Password");
-    }
-  };
-
+  // [6] 리스트 로드 (파이어베이스)
   const loadList = () => {
       if(!dbRef.current) return;
       dbRef.current.collection("detections").orderBy("timestamp", "desc").onSnapshot(snapshot => {
@@ -318,6 +320,22 @@ function App() {
     });
   };
 
+  // [7] 기타 버튼 기능들
+  const toggleList = () => {
+      document.getElementById('list-panel').classList.toggle('open');
+  };
+
+  const authProfessor = () => {
+    if (prompt("Enter Admin Password:") === "kyj") {
+        alert("✅ Admin Mode Activated");
+        document.getElementById('prof-controls').style.display = 'block';
+        document.getElementById('btn-prof').style.display = 'none';
+        loadList(); 
+    } else {
+        alert("❌ Wrong Password");
+    }
+  };
+
   const manualAdd = () => {
     const n = document.getElementById('add-name').value;
     const i = document.getElementById('add-id').value;
@@ -334,7 +352,8 @@ function App() {
     }
   };
 
-  // [7] HTML 렌더링 (사용자님 원본 HTML 구조 100%)
+  // [8] HTML 렌더링 (사용자님 원본 구조 100% 복제)
+  // Class -> className, onclick -> onClick 만 변경됨
   return (
     <>
       <div id="sidebar">
@@ -347,7 +366,7 @@ function App() {
         <input type="text" id="input-id" placeholder="Student ID" />
 
         <button id="btn-start" onClick={startSystem}>▶ Start Monitoring</button>
-        <div id="loading-msg">Initializing...</div>
+        <div id="loading-msg" style={{display:'none'}}>Initializing...</div>
 
         <button id="btn-stop" onClick={() => window.location.reload()}>⏹ Stop System</button>
         <button id="btn-list" onClick={toggleList}>📋 Detection List</button>
@@ -378,7 +397,7 @@ function App() {
             </div>
 
             <div id="status-panel" style={{display:'none'}}>
-                <div id="status-audio" className="status-box">🎤 Standby</div>
+                <div id="status-audio" className="status-box">🎤 Silence/English</div>
                 <div id="status-video" className="status-box">🤐 0%</div>
             </div>
 
@@ -389,7 +408,7 @@ function App() {
         </div>
       </div>
 
-      <video id="input_video" playsInline></video>
+      <video id="input_video" playsInline style={{display:'none'}}></video>
     </>
   );
 }
