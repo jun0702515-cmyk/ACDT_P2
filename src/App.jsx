@@ -4,8 +4,11 @@ import './index.css';
 function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [statusText, setStatusText] = useState("System Standby");
+  
+  // 패널 토글 상태
   const [showSettings, setShowSettings] = useState(false);
-  const [showLogs, setShowLogs] = useState(true); 
+  const [showLogs, setShowLogs] = useState(false); 
+
   const [settings, setSettings] = useState({ confidence: 50, mouthOpen: 4, lipMovement: 20, strictness: 3 });
   const [logs, setLogs] = useState([]);
   const [detectedStudents, setDetectedStudents] = useState({});
@@ -21,7 +24,6 @@ function App() {
   const alertTimeout = useRef(null);
   const dbRef = useRef(null);
 
-  // 초기화 (Firebase 연결)
   useEffect(() => {
     if (window.firebase && !dbRef.current) {
       const firebaseConfig = {
@@ -46,6 +48,7 @@ function App() {
     return Math.sqrt(variance);
   };
 
+  // 주파수 변환 (오디오 문제 해결의 핵심)
   const downsampleBuffer = (buffer, sampleRate, outSampleRate) => {
     if (outSampleRate === sampleRate) return buffer;
     let sampleRateRatio = sampleRate / outSampleRate;
@@ -219,10 +222,25 @@ function App() {
         <div className="title-container"><h2>Korean Killer</h2><div id="kk-logo">KK</div></div>
         <input type="text" id="input-name" placeholder="Name" />
         <input type="text" id="input-id" placeholder="Student ID" />
+        
+        {/* Start / Stop 버튼 */}
         {!isRunning && <button id="btn-start" onClick={startSystem}>▶ Start Monitoring</button>}
         <div id="loading-msg" style={{ display: isRunning ? 'none' : 'none' }}>Initializing...</div>
         {isRunning && <button id="btn-stop" style={{display:'block'}} onClick={() => window.location.reload()}>⏹ Stop System</button>}
+        
+        {/* Detection List 버튼 */}
         <button id="btn-list" onClick={() => document.getElementById('list-panel').classList.toggle('open')}>📋 Detection List</button>
+        
+        {/* Admin Auth 버튼 (위치 이동: List 밑으로) */}
+        <button id="btn-prof" onClick={() => { if (prompt("Password:") === "kyj") { document.getElementById('prof-controls').style.display = 'block'; document.getElementById('btn-prof').style.display = 'none'; } }}>🔒 Admin Auth</button>
+
+        {/* 설정/로그 토글 버튼 (Admin Auth 밑으로 추가) */}
+        <div style={{display: 'flex', gap: '5px', marginTop: '10px'}}>
+            <button className={`btn-toggle ${showSettings ? 'active' : ''}`} onClick={() => { setShowSettings(!showSettings); setShowLogs(false); }}>⚙️ Settings</button>
+            <button className={`btn-toggle ${showLogs ? 'active' : ''}`} onClick={() => { setShowLogs(!showLogs); setShowSettings(false); }}>📊 Logs</button>
+        </div>
+
+        {/* 교수님 컨트롤 (숨겨짐) */}
         <div id="prof-controls">
           <p>👮‍♂️ [Professor Mode]</p>
           <input type="text" id="add-name" placeholder="Name" style={{marginBottom:'5px'}} />
@@ -231,7 +249,6 @@ function App() {
           <hr style={{borderColor:'#555', margin:'15px 0'}} />
           <button onClick={deleteAllData} className="btn-delete-all">⚠️ DELETE ALL DATA</button>
         </div>
-        <button id="btn-prof" onClick={() => { if (prompt("Password:") === "kyj") { document.getElementById('prof-controls').style.display = 'block'; document.getElementById('btn-prof').style.display = 'none'; } }}>🔒 Admin Auth</button>
       </div>
 
       <div id="list-panel">
@@ -250,19 +267,21 @@ function App() {
       </div>
 
       <div id="main-content">
-        <div id="monitor-controls">
-          <button className={`ctrl-btn ${showSettings ? 'active' : ''}`} onClick={() => { setShowSettings(!showSettings); setShowLogs(false); }}>⚙️ Settings</button>
-          <button className={`ctrl-btn ${showLogs ? 'active' : ''}`} onClick={() => { setShowLogs(!showLogs); setShowSettings(false); }}>📊 Live Log</button>
-        </div>
-        <div id="visual-wrapper">
-          <img src="1.jpg" id="monitor-image" className="side-img" alt="Monitor" />
-          <div id="center-stage">
+        {/* 왼쪽: 모니터 이미지 */}
+        <img src="1.jpg" id="monitor-image" className="side-img" alt="Monitor" />
+        
+        {/* 오른쪽(중앙): 줌 카메라 & 오버레이 */}
+        <div id="center-stage">
             <div id="placeholder" style={{textAlign:'center'}}><h1 style={{color:'white'}}>{statusText}</h1><p style={{color:'#aaa'}}>Please enter your Name and ID to start.</p></div>
+            
             <div id="status-panel" style={{display: 'none'}}>
               <div id="status-audio" className={`status-box ${audioStatus.label === 'korean' && audioStatus.score > settings.confidence/100 ? 'active-red' : ''}`}>🎤 {audioStatus.label.toUpperCase()} ({Math.round(audioStatus.score * 100)}%)</div>
               <div id="status-video" className={`status-box ${videoStatus.state === 'Speaking' ? 'active-green' : ''}`}>{videoStatus.state === 'Speaking' ? '🗣️' : '🤐'} {Math.round(videoStatus.gap)}%</div>
             </div>
+            
             <div id="camera-wrapper"><canvas ref={canvasRef} id="output_canvas"></canvas><div id="alert-overlay">🚨 DETECTED!</div></div>
+            
+            {/* 설정 패널 (중앙 오버레이) */}
             <div id="panel-settings" style={{ display: showSettings ? 'flex' : 'none' }} className="overlay-panel">
               <div className="panel-header"><span>SETTINGS</span><span style={{cursor:'pointer'}} onClick={() => setShowSettings(false)}>✕</span></div>
               <div className="setting-row"><div className="setting-label"><span>AI Confidence</span><span>{settings.confidence}%</span></div><input type="range" min="1" max="99" value={settings.confidence} onChange={(e) => setSettings({...settings, confidence: parseInt(e.target.value)})} /></div>
@@ -270,6 +289,8 @@ function App() {
               <div className="setting-row"><div className="setting-label"><span>Lip Movement</span><span>Lv {settings.lipMovement}</span></div><input type="range" min="1" max="100" value={settings.lipMovement} onChange={(e) => setSettings({...settings, lipMovement: parseInt(e.target.value)})} /></div>
               <div className="setting-row"><div className="setting-label"><span>Strictness</span><span>{settings.strictness} frames</span></div><input type="range" min="1" max="10" value={settings.strictness} onChange={(e) => setSettings({...settings, strictness: parseInt(e.target.value)})} /></div>
             </div>
+            
+            {/* 로그 패널 (중앙 오버레이) */}
             <div id="panel-logs" style={{ display: showLogs ? 'flex' : 'none' }} className="overlay-panel">
               <div className="panel-header"><span>LIVE LOGS</span><span style={{cursor:'pointer'}} onClick={() => setShowLogs(false)}>✕</span></div>
               <div id="log-container">
@@ -277,7 +298,6 @@ function App() {
                 {logs.map(log => (<div key={log.id} className={`log-entry ${log.label === 'VIOLATION' ? 'violation' : ''}`}><span>[{log.time}] {log.label.toUpperCase()}</span><span>{log.visual} / {log.score}%</span></div>))}
               </div>
             </div>
-          </div>
         </div>
       </div>
       <video id="input_video" playsInline style={{display:'none'}}></video>
