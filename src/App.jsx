@@ -2,31 +2,41 @@ import { useState, useEffect, useRef } from 'react';
 import './index.css'; 
 
 function App() {
+  // --- [상태 관리] ---
   const [isRunning, setIsRunning] = useState(false);
   const [statusText, setStatusText] = useState("System Standby");
-  
-  // 패널 토글 상태
-  const [showSettings, setShowSettings] = useState(false);
-  const [showLogs, setShowLogs] = useState(false); 
-
-  const [settings, setSettings] = useState({ confidence: 50, mouthOpen: 4, lipMovement: 20, strictness: 3 });
   const [logs, setLogs] = useState([]);
   const [detectedStudents, setDetectedStudents] = useState({});
-  const [audioStatus, setAudioStatus] = useState({ label: 'Standby', score: 0 });
-  const [videoStatus, setVideoStatus] = useState({ state: 'Closed', gap: 0 });
+  const [showList, setShowList] = useState(false);
 
+  // AI & 센서 상태
+  const [audioLabel, setAudioLabel] = useState("Standby");
+  const [audioScore, setAudioScore] = useState(0);
+  const [videoState, setVideoState] = useState("Closed");
+  const [videoGap, setVideoGap] = useState(0);
+
+  // --- [설정값] ---
+  const CONFIG = {
+    confidence: 0.5,    // AI 신뢰도 50%
+    mouthOpen: 0.004,   // 입벌림 민감도 (4%)
+    lipMovement: 0.002, // 입 움직임 민감도
+    strictness: 3       // 적발 기준 프레임
+  };
+
+  // --- [내부 변수] ---
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
-  const classifierRef = useRef(null); 
-  const audioCtxRef = useRef(null);   
+  const classifierRef = useRef(null);
+  const audioCtxRef = useRef(null);
   const lipHistory = useRef([]);
   const violationQueue = useRef([]);
-  const alertTimeout = useRef(null);
   const dbRef = useRef(null);
+  const alertTimeout = useRef(null);
 
+  // --- [초기화: 파이어베이스] ---
   useEffect(() => {
     if (window.firebase && !dbRef.current) {
-      const firebaseConfig = {
+      const config = {
         apiKey: "AIzaSyDaLlrTKsMCpCzVgBW9icTmEPcuO_zoWVY",
         authDomain: "acdt-project.firebaseapp.com",
         projectId: "acdt-project",
@@ -35,273 +45,281 @@ function App() {
         appId: "1:243281762920:web:6641d9eadfe1e93442f9dd",
         measurementId: "G-J9TVZXN3LE"
       };
-      if (!window.firebase.apps.length) { window.firebase.initializeApp(firebaseConfig); }
+      if (!window.firebase.apps.length) window.firebase.initializeApp(config);
       dbRef.current = window.firebase.firestore();
-      loadList();
+      
+      // 명단 실시간 로드
+      dbRef.current.collection("detections").orderBy("timestamp", "desc")
+        .onSnapshot(snap => {
+          const st = {};
+          snap.forEach(doc => {
+            const d = doc.data();
+            if (!st[d.studentId]) st[d.studentId] = { name: d.name, id: d.studentId, records: [] };
+            st[d.studentId].records.push(d.timestamp ? new Date(d.timestamp.toDate()).toLocaleTimeString() : "-");
+          });
+          setDetectedStudents(st);
+        });
     }
   }, []);
 
-  const calculateStandardDeviation = (arr) => {
-    if (arr.length === 0) return 0;
-    const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
-    const variance = arr.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / arr.length;
-    return Math.sqrt(variance);
-  };
-
-  // 주파수 변환 (오디오 문제 해결의 핵심)
-  const downsampleBuffer = (buffer, sampleRate, outSampleRate) => {
-    if (outSampleRate === sampleRate) return buffer;
-    let sampleRateRatio = sampleRate / outSampleRate;
-    let newLength = Math.round(buffer.length / sampleRateRatio);
-    let result = new Float32Array(newLength);
-    let offsetResult = 0; let offsetBuffer = 0;
-    while (offsetResult < result.length) {
-      let nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
-      let accum = 0, count = 0;
-      for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) { accum += buffer[i]; count++; }
-      result[offsetResult] = accum / count; offsetResult++; offsetBuffer = nextOffsetBuffer;
-    }
-    return result;
-  };
-
+  // --- [핵심 로직: 시작] ---
   const startSystem = async () => {
-    const name = document.getElementById('input-name').value;
-    const id = document.getElementById('input-id').value;
-    if (!name || !id) { alert("Please enter Name and Student ID!"); return; }
+    const name = document.getElementById('inp-name').value;
+    const id = document.getElementById('inp-id').value;
+    if (!name || !id) { alert("Input Name & ID"); return; }
 
-    setStatusText("Initializing AI...");
+    setStatusText("Initializing...");
     try {
-      const classifier = new window.EdgeImpulseClassifier();
-      await classifier.init();
-      classifierRef.current = classifier;
-      await startAudioProcessing();
-      await startFaceMesh();
+      // 1. AI 로드
+      const cls = new window.EdgeImpulseClassifier();
+      await cls.init();
+      classifierRef.current = cls;
+
+      // 2. 오디오/비디오 시작
+      await startAudio();
+      await startVideo();
+
       setIsRunning(true);
       setStatusText("Monitoring Active 🟢");
-      document.getElementById('placeholder').style.display = 'none';
-      document.getElementById('camera-wrapper').style.display = 'block';
-      document.getElementById('status-panel').style.display = 'flex';
-    } catch (err) {
-      console.error(err);
-      alert("Error: " + err.message);
+    } catch (e) {
+      alert("Error: " + e.message);
       window.location.reload();
     }
   };
 
-  const startAudioProcessing = async () => {
-    const AudioContext = window.AudioContext || window.webkitAudioContext;
-    const audioCtx = new AudioContext();
-    audioCtxRef.current = audioCtx;
-    if (audioCtx.state === 'suspended') await audioCtx.resume();
+  // --- [로직: 오디오] ---
+  const startAudio = async () => {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AC();
+    audioCtxRef.current = ctx;
+    if (ctx.state === 'suspended') await ctx.resume();
+
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const source = audioCtx.createMediaStreamSource(stream);
-    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    const src = ctx.createMediaStreamSource(stream);
+    const proc = ctx.createScriptProcessor(4096, 1, 1);
+    
+    // 버퍼 처리 (주파수 변환)
     const targetRate = 16000;
-    const bufferSize = 16000; 
-    let circularBuffer = new Float32Array(bufferSize);
-    let writeIndex = 0;
-    source.connect(processor);
-    processor.connect(audioCtx.destination);
-    processor.onaudioprocess = (e) => {
+    const bufferSize = 16000;
+    let circBuffer = new Float32Array(bufferSize);
+    let wIdx = 0;
+
+    src.connect(proc);
+    proc.connect(ctx.destination);
+
+    proc.onaudioprocess = (e) => {
       if (!classifierRef.current) return;
-      const inputData = e.inputBuffer.getChannelData(0);
-      const downsampled = downsampleBuffer(inputData, audioCtx.sampleRate, targetRate);
-      for (let i = 0; i < downsampled.length; i++) { circularBuffer[writeIndex] = downsampled[i]; writeIndex = (writeIndex + 1) % bufferSize; }
-      let linearBuffer = new Float32Array(bufferSize);
-      for (let i = 0; i < bufferSize; i++) { linearBuffer[i] = circularBuffer[(writeIndex + i) % bufferSize]; }
+      const input = e.inputBuffer.getChannelData(0);
+      
+      // 다운샘플링 (44.1kHz -> 16kHz)
+      let rateRatio = ctx.sampleRate / targetRate;
+      let newLen = Math.round(input.length / rateRatio);
+      let res = new Float32Array(newLen);
+      let offRes = 0, offBuf = 0;
+      while (offRes < newLen) {
+        let nextOff = Math.round((offRes + 1) * rateRatio);
+        let accum = 0, count = 0;
+        for (let i = offBuf; i < nextOff && i < input.length; i++) { accum += input[i]; count++; }
+        res[offRes] = accum / count;
+        offRes++; offBuf = nextOff;
+      }
+
+      for (let i = 0; i < res.length; i++) {
+        circBuffer[wIdx] = res[i];
+        wIdx = (wIdx + 1) % bufferSize;
+      }
+
+      // 분류 실행
+      let linear = new Float32Array(bufferSize);
+      for (let i = 0; i < bufferSize; i++) linear[i] = circBuffer[(wIdx + i) % bufferSize];
+
       try {
-        let results = classifierRef.current.classify(linearBuffer);
-        let top = results.results.reduce((p, c) => p.value > c.value ? p : c);
-        setAudioStatus({ label: top.label, score: top.value });
+        let ret = classifierRef.current.classify(linear);
+        let top = ret.results.reduce((p, c) => p.value > c.value ? p : c);
+        setAudioLabel(top.label);
+        setAudioScore(top.value);
       } catch (ex) {}
     };
   };
 
-  const startFaceMesh = async () => {
-    const videoElement = document.getElementById('input_video');
-    const canvasElement = canvasRef.current;
-    const ctx = canvasElement.getContext('2d');
-    const faceMesh = new window.FaceMesh({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}` });
+  // --- [로직: 비디오] ---
+  const startVideo = async () => {
+    const vid = document.getElementById('hidden-video');
+    const cvs = canvasRef.current;
+    const ctx = cvs.getContext('2d');
+
+    const faceMesh = new window.FaceMesh({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}` });
     faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5 });
-    faceMesh.onResults((results) => {
-      canvasElement.width = 500; canvasElement.height = 500;
+
+    faceMesh.onResults((res) => {
+      cvs.width = 500; cvs.height = 500;
       ctx.fillStyle = "black"; ctx.fillRect(0, 0, 500, 500);
-      let currentVisualState = "Closed";
-      let gapPercent = 0;
-      if (results.image && results.multiFaceLandmarks.length > 0) {
-        const lm = results.multiFaceLandmarks[0];
-        const sW = videoElement.videoWidth; const sH = videoElement.videoHeight;
-        const upper = lm[13]; const lower = lm[14];
-        const zoom = 4.0; const cw = sW / zoom; const ch = sH / zoom;
-        let cx = ((upper.x + lower.x) / 2 * sW) - cw / 2;
-        let cy = ((upper.y + lower.y) / 2 * sH) - ch / 2;
-        ctx.drawImage(results.image, cx, cy, cw, ch, 0, 0, 500, 500);
-        const gap = lower.y - upper.y;
+
+      let state = "Closed";
+      
+      if (res.image && res.multiFaceLandmarks.length > 0) {
+        const lm = res.multiFaceLandmarks[0];
+        const sW = vid.videoWidth; const sH = vid.videoHeight;
+        const up = lm[13]; const low = lm[14];
+
+        // 줌 그리기
+        const zoom = 4.0; 
+        const cw = sW/zoom; const ch = sH/zoom;
+        let cx = ((up.x + low.x)/2 * sW) - cw/2;
+        let cy = ((up.y + low.y)/2 * sH) - ch/2;
+        ctx.drawImage(res.image, cx, cy, cw, ch, 0, 0, 500, 500);
+
+        // 로직
+        const gap = low.y - up.y;
+        setVideoGap(Math.round((gap/0.05)*100));
+        
         lipHistory.current.push(gap);
         if (lipHistory.current.length > 5) lipHistory.current.shift();
-        const movement = calculateStandardDeviation(lipHistory.current);
-        gapPercent = (gap / 0.05) * 100;
-        const mouthThreshold = settings.mouthOpen / 1000; 
-        const moveThreshold = settings.lipMovement / 10000;
-        if (gap > mouthThreshold) {
-          if (movement > moveThreshold) currentVisualState = "Speaking";
-          else currentVisualState = "Open";
+        
+        // 표준편차 계산
+        const mean = lipHistory.current.reduce((a,b)=>a+b,0)/lipHistory.current.length;
+        const move = Math.sqrt(lipHistory.current.reduce((a,b)=>a+Math.pow(b-mean,2),0)/lipHistory.current.length);
+
+        if (gap > CONFIG.mouthOpen) {
+          state = move > CONFIG.lipMovement ? "Speaking" : "Open";
         }
-        checkViolation(currentVisualState);
+        
+        checkViolation(state);
       }
-      setVideoStatus({ state: currentVisualState, gap: gapPercent });
+      setVideoState(state);
     });
-    const camera = new window.Camera(videoElement, { onFrame: async () => { await faceMesh.send({ image: videoElement }); }, width: 1280, height: 720 });
+
+    const camera = new window.Camera(vid, {
+      onFrame: async () => { await faceMesh.send({ image: vid }); },
+      width: 1280, height: 720
+    });
     await camera.start();
   };
 
-  const checkViolation = (visualState) => {
-    const isKorean = audioStatus.label === 'korean' && audioStatus.score > (settings.confidence / 100);
-    const isMouthActive = visualState === "Speaking";
-    if (isKorean && isMouthActive) { violationQueue.current.push(1); } else { violationQueue.current.push(0); }
+  // --- [판정 로직] ---
+  const checkViolation = (vState) => {
+    // 오디오는 State값 참조 (React 방식)
+    // 실제로는 Ref를 쓰는게 더 정확하지만, 간단한 구현을 위해 State 사용
+    const isKorean = audioLabel === 'korean' && audioScore > CONFIG.confidence;
+    const isMouth = vState === "Speaking";
+
+    if (isKorean && isMouth) violationQueue.current.push(1);
+    else violationQueue.current.push(0);
+    
     if (violationQueue.current.length > 10) violationQueue.current.shift();
-    const violationCount = violationQueue.current.filter(v => v === 1).length;
-    if (violationCount >= settings.strictness) { triggerDetection(); addLog("VIOLATION", 100, "Detected"); } 
-    else if (Math.random() < 0.02) { addLog(audioStatus.label, Math.round(audioStatus.score * 100), visualState); }
+    const cnt = violationQueue.current.filter(v => v === 1).length;
+
+    if (cnt >= CONFIG.strictness) {
+      doAlert();
+    }
   };
 
-  const triggerDetection = () => {
+  const doAlert = () => {
     if (alertTimeout.current) return;
-    const overlay = document.getElementById('alert-overlay');
-    if(overlay) overlay.style.display = 'block';
-    const img = document.getElementById('monitor-image');
-    if(img) { img.src = "2.jpg"; img.classList.add('alert-mode'); }
-    const name = document.getElementById('input-name').value;
-    const id = document.getElementById('input-id').value;
-    if (dbRef.current) { dbRef.current.collection("detections").add({ name: name, studentId: id, reason: "Korean Speaking", timestamp: window.firebase.firestore.FieldValue.serverTimestamp() }); }
+    
+    // UI 변경
+    const img = document.getElementById('monitor-img');
+    const overlay = document.getElementById('overlay-alert');
+    if (img) { img.src = "2.jpg"; img.classList.add('alert'); }
+    if (overlay) overlay.style.display = 'block';
+
+    // DB 저장
+    const n = document.getElementById('inp-name').value;
+    const i = document.getElementById('inp-id').value;
+    if (dbRef.current) {
+      dbRef.current.collection("detections").add({
+        name: n, studentId: i, reason: "KOREAN", timestamp: window.firebase.firestore.FieldValue.serverTimestamp()
+      });
+    }
+
+    // 3초 후 리셋
     alertTimeout.current = setTimeout(() => {
-      if(overlay) overlay.style.display = 'none';
-      if(img) { img.src = "1.jpg"; img.classList.remove('alert-mode'); }
+      if (img) { img.src = "1.jpg"; img.classList.remove('alert'); }
+      if (overlay) overlay.style.display = 'none';
       alertTimeout.current = null;
       violationQueue.current = [];
     }, 3000);
   };
 
-  const addLog = (label, score, visual) => {
-    const time = new Date().toLocaleTimeString('en-US', { hour12: false });
-    const newLog = { id: Date.now(), time, label, score, visual };
-    setLogs(prev => [newLog, ...prev].slice(0, 20));
-  };
-
-  const loadList = () => {
-    if (!dbRef.current) return;
-    dbRef.current.collection("detections").orderBy("timestamp", "desc").onSnapshot(snapshot => {
-        const students = {};
-        snapshot.forEach(doc => {
-          const data = doc.data();
-          if (!students[data.studentId]) { students[data.studentId] = { name: data.name, id: data.studentId, records: [] }; }
-          students[data.studentId].records.push({ time: data.timestamp ? new Date(data.timestamp.toDate()).toLocaleTimeString() : "Just now" });
-        });
-        setDetectedStudents(students);
-      });
-  };
-
-  const manualAdd = () => {
-    const n = document.getElementById('add-name').value;
-    const i = document.getElementById('add-id').value;
-    if(n && i && dbRef.current) { dbRef.current.collection("detections").add({name: n, studentId: i, timestamp: window.firebase.firestore.FieldValue.serverTimestamp()}); }
-  };
-
-  const deleteAllData = async () => {
-    if(window.confirm("Delete ALL?")) { 
-        const snap = await dbRef.current.collection("detections").get(); 
-        const batch = dbRef.current.batch(); 
-        snap.docs.forEach(d => batch.delete(d.ref)); 
-        await batch.commit(); 
-    }
-  };
-
+  // --- [화면 그리기] ---
   return (
-    <>
+    <div className="app-container">
+      {/* 1. 사이드바 */}
       <div id="sidebar">
-        <div className="title-container"><h2>Korean Killer</h2><div id="kk-logo">KK</div></div>
-        <input type="text" id="input-name" placeholder="Name" />
-        <input type="text" id="input-id" placeholder="Student ID" />
+        <div className="title"><h2>KOREAN KILLER</h2><div className="logo">KK</div></div>
+        <input id="inp-name" type="text" placeholder="Name" />
+        <input id="inp-id" type="text" placeholder="ID" />
         
-        {/* Start / Stop 버튼 */}
-        {!isRunning && <button id="btn-start" onClick={startSystem}>▶ Start Monitoring</button>}
-        <div id="loading-msg" style={{ display: isRunning ? 'none' : 'none' }}>Initializing...</div>
-        {isRunning && <button id="btn-stop" style={{display:'block'}} onClick={() => window.location.reload()}>⏹ Stop System</button>}
+        {!isRunning ? 
+          <button className="btn-start" onClick={startSystem}>▶ Start</button> : 
+          <button className="btn-stop" onClick={()=>window.location.reload()}>⏹ Stop</button>
+        }
         
-        {/* Detection List 버튼 */}
-        <button id="btn-list" onClick={() => document.getElementById('list-panel').classList.toggle('open')}>📋 Detection List</button>
-        
-        {/* Admin Auth 버튼 (위치 이동: List 밑으로) */}
-        <button id="btn-prof" onClick={() => { if (prompt("Password:") === "kyj") { document.getElementById('prof-controls').style.display = 'block'; document.getElementById('btn-prof').style.display = 'none'; } }}>🔒 Admin Auth</button>
+        <button className="btn-blue" onClick={() => setShowList(!showList)}>📋 List</button>
+        <button className="btn-gray" onClick={() => {
+           if(prompt("PW")==="kyj") { 
+             document.getElementById('prof-area').style.display='block'; 
+           }
+        }}>🔒 Admin</button>
 
-        {/* 설정/로그 토글 버튼 (Admin Auth 밑으로 추가) */}
-        <div style={{display: 'flex', gap: '5px', marginTop: '10px'}}>
-            <button className={`btn-toggle ${showSettings ? 'active' : ''}`} onClick={() => { setShowSettings(!showSettings); setShowLogs(false); }}>⚙️ Settings</button>
-            <button className={`btn-toggle ${showLogs ? 'active' : ''}`} onClick={() => { setShowLogs(!showLogs); setShowSettings(false); }}>📊 Logs</button>
-        </div>
-
-        {/* 교수님 컨트롤 (숨겨짐) */}
-        <div id="prof-controls">
-          <p>👮‍♂️ [Professor Mode]</p>
-          <input type="text" id="add-name" placeholder="Name" style={{marginBottom:'5px'}} />
-          <input type="text" id="add-id" placeholder="ID" style={{marginBottom:'5px'}} />
-          <button onClick={manualAdd} style={{background:'#ff9800'}}>Manual Add</button>
-          <hr style={{borderColor:'#555', margin:'15px 0'}} />
-          <button onClick={deleteAllData} className="btn-delete-all">⚠️ DELETE ALL DATA</button>
+        <div id="prof-area" style={{display:'none', marginTop:'10px', borderTop:'1px solid #555', paddingTop:'10px'}}>
+           <p style={{color:'orange', margin:0}}>Admin Mode</p>
+           <button className="btn-red" onClick={async ()=>{
+             if(confirm("DELETE ALL?")) {
+               const s = await dbRef.current.collection("detections").get();
+               const b = dbRef.current.batch();
+               s.docs.forEach(d=>b.delete(d.ref));
+               await b.commit();
+             }
+           }}>⚠️ Reset DB</button>
         </div>
       </div>
 
-      <div id="list-panel">
-        <h3>🚨 Detected Students</h3>
-        <ul id="student-list" style={{listStyle:'none', padding:0}}>
-          {Object.values(detectedStudents).map(student => (
-            <li key={student.id} className={`student-item ${student.records.length > 3 ? 'problematic' : ''}`}>
-              <div className="item-header">
-                <div className="student-info"><b>{student.name} {student.records.length > 3 ? '⚠️' : ''}</b><br/><span>{student.id}</span></div>
-                <div className="count-badge" onClick={(e) => { const el = e.target.parentElement.nextElementSibling; el.style.display = el.style.display === 'block' ? 'none' : 'block'; }}>{student.records.length}</div>
-              </div>
-              <div className="timestamp-list">{student.records.map((r, i) => <div key={i}>🕒 {r.time}</div>)}</div>
+      {/* 2. 명단 패널 (숨김/표시) */}
+      <div id="list-panel" className={showList ? 'open' : ''}>
+        <h3>🚨 Detections</h3>
+        <ul>
+          {Object.values(detectedStudents).map(s => (
+            <li key={s.id} className={s.records.length > 3 ? 'bad' : ''}>
+              <b>{s.name}</b> ({s.id}) <span className="badge">{s.records.length}</span>
+              <div className="times">{s.records.map((t,i)=><div key={i}>{t}</div>)}</div>
             </li>
           ))}
         </ul>
       </div>
 
+      {/* 3. 메인 화면 */}
       <div id="main-content">
-        {/* 왼쪽: 모니터 이미지 */}
-        <img src="1.jpg" id="monitor-image" className="side-img" alt="Monitor" />
-        
-        {/* 오른쪽(중앙): 줌 카메라 & 오버레이 */}
+        {/* 왼쪽: 이미지 */}
+        <img id="monitor-img" src="1.jpg" alt="Monitor" />
+
+        {/* 오른쪽: 줌 카메라 */}
         <div id="center-stage">
-            <div id="placeholder" style={{textAlign:'center'}}><h1 style={{color:'white'}}>{statusText}</h1><p style={{color:'#aaa'}}>Please enter your Name and ID to start.</p></div>
-            
-            <div id="status-panel" style={{display: 'none'}}>
-              <div id="status-audio" className={`status-box ${audioStatus.label === 'korean' && audioStatus.score > settings.confidence/100 ? 'active-red' : ''}`}>🎤 {audioStatus.label.toUpperCase()} ({Math.round(audioStatus.score * 100)}%)</div>
-              <div id="status-video" className={`status-box ${videoStatus.state === 'Speaking' ? 'active-green' : ''}`}>{videoStatus.state === 'Speaking' ? '🗣️' : '🤐'} {Math.round(videoStatus.gap)}%</div>
+          {!isRunning && <div className="placeholder"><h1>Ready</h1><p>Enter info & Start</p></div>}
+          
+          <div id="cam-box" style={{display: isRunning ? 'block' : 'none'}}>
+            <canvas ref={canvasRef} id="output_canvas"></canvas>
+            <div id="overlay-alert">🚨 DETECTED!</div>
+          </div>
+
+          {/* 상태 표시 (중앙 하단) */}
+          {isRunning && (
+            <div className="status-bar">
+              <span className={audioLabel === 'korean' && audioScore > CONFIG.confidence ? 'red' : ''}>
+                🎤 {audioLabel.toUpperCase()} {Math.round(audioScore*100)}%
+              </span>
+              <span className={videoState === 'Speaking' ? 'green' : ''}>
+                👄 {videoState} {videoGap}%
+              </span>
             </div>
-            
-            <div id="camera-wrapper"><canvas ref={canvasRef} id="output_canvas"></canvas><div id="alert-overlay">🚨 DETECTED!</div></div>
-            
-            {/* 설정 패널 (중앙 오버레이) */}
-            <div id="panel-settings" style={{ display: showSettings ? 'flex' : 'none' }} className="overlay-panel">
-              <div className="panel-header"><span>SETTINGS</span><span style={{cursor:'pointer'}} onClick={() => setShowSettings(false)}>✕</span></div>
-              <div className="setting-row"><div className="setting-label"><span>AI Confidence</span><span>{settings.confidence}%</span></div><input type="range" min="1" max="99" value={settings.confidence} onChange={(e) => setSettings({...settings, confidence: parseInt(e.target.value)})} /></div>
-              <div className="setting-row"><div className="setting-label"><span>Mouth Open (Gap)</span><span>{(settings.mouthOpen / 10).toFixed(1)}%</span></div><input type="range" min="1" max="50" value={settings.mouthOpen} onChange={(e) => setSettings({...settings, mouthOpen: parseInt(e.target.value)})} /></div>
-              <div className="setting-row"><div className="setting-label"><span>Lip Movement</span><span>Lv {settings.lipMovement}</span></div><input type="range" min="1" max="100" value={settings.lipMovement} onChange={(e) => setSettings({...settings, lipMovement: parseInt(e.target.value)})} /></div>
-              <div className="setting-row"><div className="setting-label"><span>Strictness</span><span>{settings.strictness} frames</span></div><input type="range" min="1" max="10" value={settings.strictness} onChange={(e) => setSettings({...settings, strictness: parseInt(e.target.value)})} /></div>
-            </div>
-            
-            {/* 로그 패널 (중앙 오버레이) */}
-            <div id="panel-logs" style={{ display: showLogs ? 'flex' : 'none' }} className="overlay-panel">
-              <div className="panel-header"><span>LIVE LOGS</span><span style={{cursor:'pointer'}} onClick={() => setShowLogs(false)}>✕</span></div>
-              <div id="log-container">
-                {logs.length === 0 && <div style={{textAlign:'center', color:'#555', marginTop:'20px'}}>Waiting for data...</div>}
-                {logs.map(log => (<div key={log.id} className={`log-entry ${log.label === 'VIOLATION' ? 'violation' : ''}`}><span>[{log.time}] {log.label.toUpperCase()}</span><span>{log.visual} / {log.score}%</span></div>))}
-              </div>
-            </div>
+          )}
         </div>
       </div>
-      <video id="input_video" playsInline style={{display:'none'}}></video>
-    </>
+
+      {/* 숨겨진 비디오 태그 */}
+      <video id="hidden-video" ref={videoRef} playsInline autoPlay style={{display:'none'}}></video>
+    </div>
   );
 }
+
 export default App;
