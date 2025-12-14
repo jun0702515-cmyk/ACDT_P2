@@ -2,36 +2,25 @@ import { useState, useEffect, useRef } from 'react';
 import './index.css'; 
 
 function App() {
-  const [isRunning, setIsRunning] = useState(false);
-  const [statusText, setStatusText] = useState("System Standby");
-  
-  // 패널 토글
-  const [showSettings, setShowSettings] = useState(false);
-  const [showLogs, setShowLogs] = useState(false);
-
-  // 감지 설정
-  const [settings, setSettings] = useState({ confidence: 50, mouthOpen: 4, lipMovement: 20, strictness: 3 });
-  
-  // 데이터
-  const [logs, setLogs] = useState([]);
   const [detectedStudents, setDetectedStudents] = useState({});
-  const [audioStatus, setAudioStatus] = useState({ label: 'Standby', score: 0 });
-  const [videoStatus, setVideoStatus] = useState({ state: 'Closed', gap: 0 });
-
-  // Refs
-  const videoRef = useRef(null);
-  const canvasRef = useRef(null);
-  const classifierRef = useRef(null); 
-  const audioCtxRef = useRef(null);   
-  const lipHistory = useRef([]);
-  const violationQueue = useRef([]);
-  const alertTimeout = useRef(null);
   const dbRef = useRef(null);
+  
+  // AI 및 센서 관련 변수
+  const classifierRef = useRef(null);
+  const audioCtxRef = useRef(null);
+  
+  // 로직 상태 변수
+  const [isRunning, setIsRunning] = useState(false);
+  const [audioState, setAudioState] = useState({ label: 'Standby', active: false });
+  const lastKoreanTime = useRef(0);
+  const lastMouthTime = useRef(0);
+  const lastTriggerTime = useRef(0);
+  const alertTimeout = useRef(null);
 
-  // 초기화
+  // [1] 초기화: 파이어베이스 연결
   useEffect(() => {
     if (window.firebase && !dbRef.current) {
-      const config = {
+      const firebaseConfig = {
         apiKey: "AIzaSyDaLlrTKsMCpCzVgBW9icTmEPcuO_zoWVY",
         authDomain: "acdt-project.firebaseapp.com",
         projectId: "acdt-project",
@@ -40,19 +29,53 @@ function App() {
         appId: "1:243281762920:web:6641d9eadfe1e93442f9dd",
         measurementId: "G-J9TVZXN3LE"
       };
-      if (!window.firebase.apps.length) window.firebase.initializeApp(config);
+      if (!window.firebase.apps.length) window.firebase.initializeApp(firebaseConfig);
       dbRef.current = window.firebase.firestore();
       loadList();
     }
   }, []);
 
-  const calculateStandardDeviation = (arr) => {
-    if (arr.length === 0) return 0;
-    const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
-    const variance = arr.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / arr.length;
-    return Math.sqrt(variance);
+  // [2] 시스템 시작 (AI 로드 -> 오디오 -> 비디오)
+  const startSystem = async () => {
+    const name = document.getElementById('input-name').value;
+    const id = document.getElementById('input-id').value;
+    if (!name || !id) { alert("Please enter Name and Student ID!"); return; }
+
+    const btn = document.getElementById('btn-start');
+    const msg = document.getElementById('loading-msg');
+    if(btn) btn.disabled = true;
+    if(msg) { msg.style.display = 'block'; msg.innerText = "Initializing AI..."; }
+
+    try {
+      // (1) Edge Impulse AI 로드
+      const classifier = new window.EdgeImpulseClassifier();
+      await classifier.init();
+      classifierRef.current = classifier;
+
+      // (2) 오디오 시작 (기존 WebSpeech 대신 Edge Impulse 사용)
+      await startAudioProcessing();
+
+      // (3) 비디오 시작 (FaceMesh)
+      await startFaceMesh();
+
+      // UI 업데이트
+      if(msg) msg.style.display = 'none';
+      if(btn) btn.style.display = 'none';
+      document.getElementById('btn-stop').style.display = 'block';
+      document.getElementById('placeholder').style.display = 'none';
+      document.getElementById('camera-wrapper').style.display = 'block';
+      document.getElementById('status-panel').style.display = 'flex';
+      
+      setIsRunning(true);
+
+    } catch (err) {
+      console.error(err);
+      alert("Error: " + err.message);
+      window.location.reload();
+    }
   };
 
+  // [3] 오디오 처리 (깃허브 로직 이식)
   const downsampleBuffer = (buffer, sampleRate, outSampleRate) => {
     if (outSampleRate === sampleRate) return buffer;
     let sampleRateRatio = sampleRate / outSampleRate;
@@ -68,238 +91,307 @@ function App() {
     return result;
   };
 
-  const startSystem = async () => {
-    const name = document.getElementById('input-name').value;
-    const id = document.getElementById('input-id').value;
-    if (!name || !id) { alert("Please enter Name and Student ID!"); return; }
-
-    setStatusText("Initializing AI...");
-    try {
-      const classifier = new window.EdgeImpulseClassifier();
-      await classifier.init();
-      classifierRef.current = classifier;
-      await startAudioProcessing();
-      await startFaceMesh();
-      
-      setIsRunning(true);
-      setStatusText("Monitoring Active 🟢");
-      
-      // 화면 전환
-      document.getElementById('placeholder').style.display = 'none';
-      document.getElementById('camera-wrapper').style.display = 'block';
-      document.getElementById('status-panel').style.display = 'flex';
-    } catch (err) {
-      console.error(err);
-      alert("Error: " + err.message);
-      window.location.reload();
-    }
-  };
-
   const startAudioProcessing = async () => {
     const AudioContext = window.AudioContext || window.webkitAudioContext;
-    const audioCtx = new AudioContext();
-    audioCtxRef.current = audioCtx;
-    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    const ctx = new AudioContext();
+    audioCtxRef.current = ctx;
+    if (ctx.state === 'suspended') await ctx.resume();
+
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const source = audioCtx.createMediaStreamSource(stream);
-    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    const source = ctx.createMediaStreamSource(stream);
+    const processor = ctx.createScriptProcessor(4096, 1, 1);
+    
+    // 버퍼 설정
     const targetRate = 16000;
     const bufferSize = 16000; 
     let circularBuffer = new Float32Array(bufferSize);
     let writeIndex = 0;
+
     source.connect(processor);
-    processor.connect(audioCtx.destination);
+    processor.connect(ctx.destination);
+
     processor.onaudioprocess = (e) => {
       if (!classifierRef.current) return;
+
       const inputData = e.inputBuffer.getChannelData(0);
-      const downsampled = downsampleBuffer(inputData, audioCtx.sampleRate, targetRate);
-      for (let i = 0; i < downsampled.length; i++) { circularBuffer[writeIndex] = downsampled[i]; writeIndex = (writeIndex + 1) % bufferSize; }
+      const downsampled = downsampleBuffer(inputData, ctx.sampleRate, targetRate);
+
+      for (let i = 0; i < downsampled.length; i++) {
+        circularBuffer[writeIndex] = downsampled[i];
+        writeIndex = (writeIndex + 1) % bufferSize;
+      }
+
+      // 분류 실행
       let linearBuffer = new Float32Array(bufferSize);
-      for (let i = 0; i < bufferSize; i++) { linearBuffer[i] = circularBuffer[(writeIndex + i) % bufferSize]; }
+      for (let i = 0; i < bufferSize; i++) {
+        linearBuffer[i] = circularBuffer[(writeIndex + i) % bufferSize];
+      }
+
       try {
         let results = classifierRef.current.classify(linearBuffer);
         let top = results.results.reduce((p, c) => p.value > c.value ? p : c);
-        setAudioStatus({ label: top.label, score: top.value });
+        
+        // 결과 처리 (Korean 감지 시)
+        const statusEl = document.getElementById('status-audio');
+        if (top.label === 'korean' && top.value > 0.5) {
+             lastKoreanTime.current = Date.now();
+             if(statusEl) {
+                 statusEl.innerText = "🔊 Korean Detected!";
+                 statusEl.className = "status-box active-red";
+             }
+             checkViolation();
+        } else {
+             // 1.5초 지나면 상태 복구
+             if (Date.now() - lastKoreanTime.current > 1500 && statusEl) {
+                 statusEl.innerText = "🎤 Silence/English";
+                 statusEl.className = "status-box";
+             }
+        }
       } catch (ex) {}
     };
   };
 
+  // [4] 비디오 처리 (FaceMesh - 사용자님 로직 유지)
   const startFaceMesh = async () => {
     const videoElement = document.getElementById('input_video');
-    const canvasElement = canvasRef.current;
+    const canvasElement = document.getElementById('output_canvas');
     const ctx = canvasElement.getContext('2d');
-    const faceMesh = new window.FaceMesh({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}` });
+    
+    const faceMesh = new window.FaceMesh({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`});
     faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5 });
+    
     faceMesh.onResults((results) => {
       canvasElement.width = 500; canvasElement.height = 500;
       ctx.fillStyle = "black"; ctx.fillRect(0, 0, 500, 500);
-      let currentVisualState = "Closed";
-      let gapPercent = 0;
+
       if (results.image && results.multiFaceLandmarks.length > 0) {
-        const lm = results.multiFaceLandmarks[0];
-        const sW = videoElement.videoWidth; const sH = videoElement.videoHeight;
-        const upper = lm[13]; const lower = lm[14];
-        const zoom = 4.0; const cw = sW / zoom; const ch = sH / zoom;
-        let cx = ((upper.x + lower.x) / 2 * sW) - cw / 2;
-        let cy = ((upper.y + lower.y) / 2 * sH) - ch / 2;
-        ctx.drawImage(results.image, cx, cy, cw, ch, 0, 0, 500, 500);
-        const gap = lower.y - upper.y;
-        lipHistory.current.push(gap);
-        if (lipHistory.current.length > 5) lipHistory.current.shift();
-        const movement = calculateStandardDeviation(lipHistory.current);
-        gapPercent = (gap / 0.05) * 100;
-        const mouthThreshold = settings.mouthOpen / 1000; 
-        const moveThreshold = settings.lipMovement / 10000;
-        if (gap > mouthThreshold) {
-          if (movement > moveThreshold) currentVisualState = "Speaking";
-          else currentVisualState = "Open";
-        }
-        checkViolation(currentVisualState);
+          const lm = results.multiFaceLandmarks[0];
+          const sW = videoElement.videoWidth; const sH = videoElement.videoHeight;
+          const upper = lm[13]; const lower = lm[14];
+          const dist = Math.abs(upper.y - lower.y) * 100;
+          
+          const MAX_OPEN_DIST = 30; 
+          let percent = (dist / MAX_OPEN_DIST) * 100;
+          percent = Math.max(0, Math.min(percent, 100));
+
+          const MOUTH_LIMIT = 5.0; 
+          const isMouthOpenNow = (dist > MOUTH_LIMIT);
+
+          const vStatus = document.getElementById('status-video');
+          if (isMouthOpenNow) {
+              lastMouthTime.current = Date.now();
+              if(vStatus) {
+                  vStatus.innerText = `👄 ${percent.toFixed(0)}% (Open)`;
+                  vStatus.className = "status-box active-green"; 
+              }
+              checkViolation();
+          } else {
+              if(vStatus) {
+                  vStatus.innerText = `🤐 ${percent.toFixed(0)}% (Closed)`;
+                  vStatus.className = "status-box";
+              }
+          }
+
+          const zoom = 4.0; const cw = sW/zoom; const ch = sH/zoom;
+          let cx = ((upper.x + lower.x)/2 * sW) - cw/2;
+          let cy = ((upper.y + lower.y)/2 * sH) - ch/2;
+          ctx.drawImage(results.image, cx, cy, cw, ch, 0, 0, 500, 500);
       }
-      setVideoStatus({ state: currentVisualState, gap: gapPercent });
     });
-    const camera = new window.Camera(videoElement, { onFrame: async () => { await faceMesh.send({ image: videoElement }); }, width: 1280, height: 720 });
+
+    const camera = new window.Camera(videoElement, {
+      onFrame: async () => { await faceMesh.send({image: videoElement}); },
+      width: 1280, height: 720
+    });
     await camera.start();
   };
 
-  const checkViolation = (visualState) => {
-    const isKorean = audioStatus.label === 'korean' && audioStatus.score > (settings.confidence / 100);
-    const isMouthActive = visualState === "Speaking";
-    if (isKorean && isMouthActive) { violationQueue.current.push(1); } else { violationQueue.current.push(0); }
-    if (violationQueue.current.length > 10) violationQueue.current.shift();
-    const violationCount = violationQueue.current.filter(v => v === 1).length;
-    if (violationCount >= settings.strictness) { triggerDetection(); addLog("VIOLATION", 100, "Detected"); } 
-    else if (Math.random() < 0.02) { addLog(audioStatus.label, Math.round(audioStatus.score * 100), visualState); }
+  // [5] 위반 감지 (로직 통합)
+  const checkViolation = () => {
+    const now = Date.now();
+    if (now - lastTriggerTime.current < 5000) return; // 쿨다운
+
+    const isKoreanRecent = (now - lastKoreanTime.current < 3000);
+    const isMouthRecent = (now - lastMouthTime.current < 3000);
+
+    if (isKoreanRecent && isMouthRecent) {
+      triggerDetection();
+    }
   };
 
   const triggerDetection = () => {
-    if (alertTimeout.current) return;
+    lastTriggerTime.current = Date.now(); 
+
+    // 오버레이
     const overlay = document.getElementById('alert-overlay');
-    if(overlay) overlay.style.display = 'block';
+    if(overlay) {
+        overlay.style.display = 'block';
+        overlay.innerText = `🚨 DETECTED!`;
+        setTimeout(() => overlay.style.display = 'none', 2000);
+    }
+    
+    // 상태창 빨간불
+    const sv = document.getElementById('status-video');
+    if(sv) sv.className = "status-box active-red";
+
+    // 이미지 변경
     const img = document.getElementById('monitor-image');
-    if(img) { img.src = "2.jpg"; img.classList.add('alert-mode'); }
+    if(img) {
+        img.src = "2.jpg"; 
+        img.classList.add('alert-mode');
+        
+        if (alertTimeout.current) clearTimeout(alertTimeout.current);
+        alertTimeout.current = setTimeout(() => {
+            img.src = "1.jpg"; 
+            img.classList.remove('alert-mode');
+        }, 5000);
+    }
+
+    // DB 전송
     const name = document.getElementById('input-name').value;
     const id = document.getElementById('input-id').value;
-    if (dbRef.current) { dbRef.current.collection("detections").add({ name: name, studentId: id, reason: "Korean Speaking", timestamp: window.firebase.firestore.FieldValue.serverTimestamp() }); }
-    alertTimeout.current = setTimeout(() => {
-      if(overlay) overlay.style.display = 'none';
-      if(img) { img.src = "1.jpg"; img.classList.remove('alert-mode'); }
-      alertTimeout.current = null;
-      violationQueue.current = [];
-    }, 3000);
+    if(dbRef.current) {
+        dbRef.current.collection("detections").add({
+            name: name, studentId: id, reason: "Korean + Mouth Open",
+            timestamp: window.firebase.firestore.FieldValue.serverTimestamp()
+        });
+    }
   };
 
-  const addLog = (label, score, visual) => {
-    const time = new Date().toLocaleTimeString('en-US', { hour12: false });
-    const newLog = { id: Date.now(), time, label, score, visual };
-    setLogs(prev => [newLog, ...prev].slice(0, 20));
+  // [6] 기타 UI 기능들
+  const toggleList = () => {
+      document.getElementById('list-panel').classList.toggle('open');
+  };
+
+  const authProfessor = () => {
+    if (prompt("Enter Admin Password:") === "kyj") {
+        alert("✅ Admin Mode Activated");
+        document.getElementById('prof-controls').style.display = 'block';
+        document.getElementById('btn-prof').style.display = 'none';
+        loadList(); 
+    } else {
+        alert("❌ Wrong Password");
+    }
   };
 
   const loadList = () => {
-    if (!dbRef.current) return;
-    dbRef.current.collection("detections").orderBy("timestamp", "desc").onSnapshot(snapshot => {
+      if(!dbRef.current) return;
+      dbRef.current.collection("detections").orderBy("timestamp", "desc").onSnapshot(snapshot => {
+        const list = document.getElementById('student-list'); 
+        if(!list) return;
+        list.innerHTML = "";
+        
         const students = {};
         snapshot.forEach(doc => {
-          const data = doc.data();
-          if (!students[data.studentId]) { students[data.studentId] = { name: data.name, id: data.studentId, records: [] }; }
-          students[data.studentId].records.push({ time: data.timestamp ? new Date(data.timestamp.toDate()).toLocaleTimeString() : "Just now" });
+            const data = doc.data();
+            const key = data.studentId;
+            if (!students[key]) { students[key] = { name: data.name, id: data.studentId, records: [] }; }
+            students[key].records.push({
+                id: doc.id,
+                time: data.timestamp ? new Date(data.timestamp.toDate()).toLocaleTimeString() : "Just now"
+            });
         });
-        setDetectedStudents(students);
-      });
+
+        Object.values(students).forEach(student => {
+            const count = student.records.length;
+            const isProblematic = count > 3; 
+            
+            const li = document.createElement('li'); 
+            li.className = isProblematic ? 'student-item problematic' : 'student-item';
+            
+            li.innerHTML = `
+                <div class="item-header">
+                    <div class="student-info">
+                        <b>${student.name} ${isProblematic ? '⚠️' : ''}</b><br>
+                        <span>${student.id}</span>
+                    </div>
+                    <div class="count-badge" onclick="this.parentElement.nextElementSibling.style.display = this.parentElement.nextElementSibling.style.display === 'block' ? 'none' : 'block'">
+                        ${count}
+                    </div>
+                </div>
+                <div class="timestamp-list">
+                    ${student.records.map(r => `<div>🕒 ${r.time}</div>`).join('')}
+                </div>
+            `;
+            list.appendChild(li);
+        });
+    });
   };
 
   const manualAdd = () => {
     const n = document.getElementById('add-name').value;
     const i = document.getElementById('add-id').value;
-    if(n && i && dbRef.current) { dbRef.current.collection("detections").add({name: n, studentId: i, timestamp: window.firebase.firestore.FieldValue.serverTimestamp()}); }
+    if(n && i && dbRef.current) dbRef.current.collection("detections").add({name: n, studentId: i, timestamp: window.firebase.firestore.FieldValue.serverTimestamp()});
   };
 
   const deleteAllData = async () => {
-    if(window.confirm("Delete ALL?")) { 
-        const snap = await dbRef.current.collection("detections").get(); 
-        const batch = dbRef.current.batch(); 
-        snap.docs.forEach(d => batch.delete(d.ref)); 
-        await batch.commit(); 
+    if (confirm("⚠️ WARNING: DELETE ALL?")) {
+        const snapshot = await dbRef.current.collection("detections").get();
+        const batch = dbRef.current.batch();
+        snapshot.docs.forEach(doc => batch.delete(doc.ref));
+        await batch.commit();
+        alert("Deleted.");
     }
   };
 
+  // [7] HTML 렌더링 (사용자님 원본 HTML 구조 100%)
   return (
     <>
       <div id="sidebar">
-        <div className="title-container"><h2>Korean Killer</h2><div id="kk-logo">KK</div></div>
+        <div className="title-container">
+            <h2>Korean Killer</h2>
+            <div id="kk-logo">KK</div>
+        </div>
+
         <input type="text" id="input-name" placeholder="Name" />
         <input type="text" id="input-id" placeholder="Student ID" />
-        {!isRunning && <button id="btn-start" onClick={startSystem}>▶ Start Monitoring</button>}
-        <div id="loading-msg" style={{ display: isRunning ? 'none' : 'none' }}>Initializing...</div>
-        {isRunning && <button id="btn-stop" style={{display:'block'}} onClick={() => window.location.reload()}>⏹ Stop System</button>}
-        
-        <button id="btn-list" onClick={() => document.getElementById('list-panel').classList.toggle('open')}>📋 Detection List</button>
-        <button id="btn-prof" onClick={() => { if (prompt("Password:") === "kyj") { document.getElementById('prof-controls').style.display = 'block'; document.getElementById('btn-prof').style.display = 'none'; } }}>🔒 Admin Auth</button>
-        
+
+        <button id="btn-start" onClick={startSystem}>▶ Start Monitoring</button>
+        <div id="loading-msg">Initializing...</div>
+
+        <button id="btn-stop" onClick={() => window.location.reload()}>⏹ Stop System</button>
+        <button id="btn-list" onClick={toggleList}>📋 Detection List</button>
+
         <div id="prof-controls">
-          <p>👮‍♂️ [Professor Mode]</p>
-          <input type="text" id="add-name" placeholder="Name" style={{marginBottom:'5px'}} />
-          <input type="text" id="add-id" placeholder="ID" style={{marginBottom:'5px'}} />
-          <button onClick={manualAdd} style={{background:'#ff9800'}}>Manual Add</button>
-          <hr style={{borderColor:'#555', margin:'15px 0'}} />
-          <button onClick={deleteAllData} className="btn-delete-all">⚠️ DELETE ALL DATA</button>
+            <p>👮‍♂️ [Professor Mode]</p>
+            <input type="text" id="add-name" placeholder="Name" style={{marginBottom:'5px'}} />
+            <input type="text" id="add-id" placeholder="ID" style={{marginBottom:'5px'}} />
+            <button onClick={manualAdd} style={{background:'#ff9800'}}>Manual Add</button>
+            <hr style={{borderColor:'#555', margin: '15px 0'}} />
+            <button onClick={deleteAllData} className="btn-delete-all">⚠️ DELETE ALL DATA</button>
         </div>
+        <button id="btn-prof" onClick={authProfessor}>🔒 Admin Auth</button>
       </div>
 
       <div id="list-panel">
         <h3>🚨 Detected Students</h3>
-        <ul id="student-list" style={{listStyle:'none', padding:0}}>
-          {Object.values(detectedStudents).map(student => (
-            <li key={student.id} className={`student-item ${student.records.length > 3 ? 'problematic' : ''}`}>
-              <div className="item-header">
-                <div className="student-info"><b>{student.name} {student.records.length > 3 ? '⚠️' : ''}</b><br/><span>{student.id}</span></div>
-                <div className="count-badge" onClick={(e) => { const el = e.target.parentElement.nextElementSibling; el.style.display = el.style.display === 'block' ? 'none' : 'block'; }}>{student.records.length}</div>
-              </div>
-              <div className="timestamp-list">{student.records.map((r, i) => <div key={i}>🕒 {r.time}</div>)}</div>
-            </li>
-          ))}
-        </ul>
+        <ul id="student-list" style={{listStyle: 'none', padding: 0}}></ul>
       </div>
 
       <div id="main-content">
-        <div id="monitor-controls">
-          <button className={`ctrl-btn ${showSettings ? 'active' : ''}`} onClick={() => { setShowSettings(!showSettings); setShowLogs(false); }}>⚙️ Settings</button>
-          <button className={`ctrl-btn ${showLogs ? 'active' : ''}`} onClick={() => { setShowLogs(!showLogs); setShowSettings(false); }}>📊 Live Log</button>
-        </div>
+        <img src="1.jpg" id="monitor-image" className="side-img" alt="Surveillance Monitor" />
 
-        <div id="visual-wrapper">
-          <img src="1.jpg" id="monitor-image" className="side-img" alt="Monitor" />
-          
-          <div id="center-stage">
-            <div id="placeholder" style={{textAlign:'center'}}><h1 style={{color:'white'}}>{statusText}</h1><p style={{color:'#aaa'}}>Please enter your Name and ID to start.</p></div>
-            
-            <div id="status-panel" style={{display: 'none'}}>
-              <div id="status-audio" className={`status-box ${audioStatus.label === 'korean' && audioStatus.score > settings.confidence/100 ? 'active-red' : ''}`}>🎤 {audioStatus.label.toUpperCase()} ({Math.round(audioStatus.score * 100)}%)</div>
-              <div id="status-video" className={`status-box ${videoStatus.state === 'Speaking' ? 'active-green' : ''}`}>{videoStatus.state === 'Speaking' ? '🗣️' : '🤐'} {Math.round(videoStatus.gap)}%</div>
+        <div id="center-stage">
+            <div id="placeholder" style={{textAlign:'center'}}>
+                <h1 style={{color:'white'}}>System Standby</h1>
+                <p style={{color:'#aaa'}}>Please enter your Name and ID to start.</p>
             </div>
-            
-            <div id="camera-wrapper"><canvas ref={canvasRef} id="output_canvas"></canvas><div id="alert-overlay">🚨 DETECTED!</div></div>
-            
-            <div id="panel-settings" style={{ display: showSettings ? 'flex' : 'none' }} className="overlay-panel">
-              <div className="panel-header"><span>SETTINGS</span><span style={{cursor:'pointer'}} onClick={() => setShowSettings(false)}>✕</span></div>
-              <div className="setting-row"><div className="setting-label"><span>AI Confidence</span><span>{settings.confidence}%</span></div><input type="range" min="1" max="99" value={settings.confidence} onChange={(e) => setSettings({...settings, confidence: parseInt(e.target.value)})} /></div>
-              <div className="setting-row"><div className="setting-label"><span>Mouth Open (Gap)</span><span>{(settings.mouthOpen / 10).toFixed(1)}%</span></div><input type="range" min="1" max="50" value={settings.mouthOpen} onChange={(e) => setSettings({...settings, mouthOpen: parseInt(e.target.value)})} /></div>
-              <div className="setting-row"><div className="setting-label"><span>Lip Movement</span><span>Lv {settings.lipMovement}</span></div><input type="range" min="1" max="100" value={settings.lipMovement} onChange={(e) => setSettings({...settings, lipMovement: parseInt(e.target.value)})} /></div>
-              <div className="setting-row"><div className="setting-label"><span>Strictness</span><span>{settings.strictness} frames</span></div><input type="range" min="1" max="10" value={settings.strictness} onChange={(e) => setSettings({...settings, strictness: parseInt(e.target.value)})} /></div>
+
+            <div id="status-panel" style={{display:'none'}}>
+                <div id="status-audio" className="status-box">🎤 Standby</div>
+                <div id="status-video" className="status-box">🤐 0%</div>
             </div>
-            
-            <div id="panel-logs" style={{ display: showLogs ? 'flex' : 'none' }} className="overlay-panel">
-              <div className="panel-header"><span>LIVE LOGS</span><span style={{cursor:'pointer'}} onClick={() => setShowLogs(false)}>✕</span></div>
-              <div id="log-container">
-                {logs.length === 0 && <div style={{textAlign:'center', color:'#555', marginTop:'20px'}}>Waiting for data...</div>}
-                {logs.map(log => (<div key={log.id} className={`log-entry ${log.label === 'VIOLATION' ? 'violation' : ''}`}><span>[{log.time}] {log.label.toUpperCase()}</span><span>{log.visual} / {log.score}%</span></div>))}
-              </div>
+
+            <div id="camera-wrapper">
+                <canvas id="output_canvas"></canvas>
+                <div id="alert-overlay">🚨 DETECTED!</div>
             </div>
-          </div>
         </div>
       </div>
-      <video id="input_video" playsInline style={{display:'none'}}></video>
+
+      <video id="input_video" playsInline></video>
     </>
   );
 }
+
 export default App;
