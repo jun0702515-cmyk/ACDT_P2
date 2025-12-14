@@ -15,9 +15,11 @@ function App() {
   const lastTriggerTime = useRef(0);
   const alertTimeout = useRef(null);
 
-  // 화면 표시용 상태 (Standby -> Listening)
+  // 화면 표시용 상태
   const [micStatus, setMicStatus] = useState("🎤 Standby");
   const [micClass, setMicClass] = useState("status-box");
+  const [videoStatus, setVideoStatus] = useState("🤐 0% (Closed)");
+  const [videoClass, setVideoClass] = useState("status-box");
 
   // [1] 초기화: 파이어베이스 연결
   useEffect(() => {
@@ -37,7 +39,7 @@ function App() {
     }
   }, []);
 
-  // [2] 시스템 시작
+  // [2] 시스템 시작 (로직 교체: WebSpeech -> Edge Impulse)
   const startSystem = async () => {
     const name = document.getElementById('input-name').value;
     const id = document.getElementById('input-id').value;
@@ -47,23 +49,25 @@ function App() {
     const msg = document.getElementById('loading-msg');
     
     if(btn) btn.disabled = true;
-    if(msg) { msg.style.display = 'block'; msg.innerText = "Starting AI..."; }
+    if(msg) { msg.style.display = 'block'; msg.innerText = "Step 1: Requesting AI Model..."; }
 
     try {
-      // (1) AI 로드
+      // (1) Edge Impulse AI 로드
       if (!classifierRef.current) {
           const classifier = new window.EdgeImpulseClassifier();
           await classifier.init();
           classifierRef.current = classifier;
       }
 
-      // (2) 오디오 시작 (가장 중요: 순서 변경)
-      await startAudioProcessing();
-
-      // (3) 비디오 시작
+      // (2) 비디오 시작 (FaceMesh)
+      if(msg) msg.innerText = "Step 2: Requesting Camera...";
       await startFaceMesh();
 
-      // UI 전환
+      // (3) 오디오 시작 (Edge Impulse Logic - 수리됨)
+      if(msg) msg.innerText = "Step 3: Requesting Microphone...";
+      await startAudioProcessing();
+
+      // UI 전환 (사용자님 코드 로직 유지)
       if(msg) msg.style.display = 'none';
       if(btn) btn.style.display = 'none';
       
@@ -72,8 +76,8 @@ function App() {
       document.getElementById('camera-wrapper').style.display = 'block';
       document.getElementById('status-panel').style.display = 'flex';
       
-      // 상태 강제 변경 (Listening...)
-      setMicStatus("🎤 Listening...");
+      // 시작 시 상태 업데이트
+      setMicStatus("🎤 Silence/English");
       setIsRunning(true);
 
     } catch (err) {
@@ -83,14 +87,13 @@ function App() {
     }
   };
 
-  // [3] 오디오 처리 (수정됨: 강제 Resume 및 보간법 적용)
+  // [3] 오디오 처리 (수정됨: 44.1kHz -> 16kHz 변환 + Resume)
   const startAudioProcessing = async () => {
-    // AudioContext 생성
     const AudioContext = window.AudioContext || window.webkitAudioContext;
     const ctx = new AudioContext();
     audioCtxRef.current = ctx;
 
-    // ★★★ 핵심 수정: 브라우저가 오디오를 막지 못하게 강제 실행 ★★★
+    // ★ 브라우저 오디오 권한 강제 활성화 (Standby 해결의 핵심)
     if (ctx.state === 'suspended') {
         await ctx.resume();
     }
@@ -99,7 +102,7 @@ function App() {
     const source = ctx.createMediaStreamSource(stream);
     const processor = ctx.createScriptProcessor(4096, 1, 1);
     
-    const targetRate = 16000; // Edge Impulse 목표 주파수
+    const targetRate = 16000; 
     const bufferSize = 16000; 
     let circularBuffer = new Float32Array(bufferSize);
     let writeIndex = 0;
@@ -112,9 +115,8 @@ function App() {
 
       const inputData = e.inputBuffer.getChannelData(0);
       
-      // ★★★ 핵심 수정: 단순하고 확실한 다운샘플링 (Linear Interpolation) ★★★
-      // 복잡한 로직 다 버리고 가장 확실한 방법으로 16kHz로 변환합니다.
-      const ratio = inputData.length / (ctx.sampleRate / targetRate * inputData.length / inputData.length); // 비율 계산
+      // ★ 주파수 변환 로직 (Linear Interpolation) - 소리가 AI에 들리도록 수정
+      const ratio = inputData.length / (ctx.sampleRate / targetRate * inputData.length / inputData.length); 
       const newLength = Math.floor(inputData.length * targetRate / ctx.sampleRate);
       const downsampled = new Float32Array(newLength);
 
@@ -123,20 +125,16 @@ function App() {
           const index1 = Math.floor(originalIndex);
           const index2 = Math.ceil(originalIndex);
           const weight = originalIndex - index1;
-          
           const val1 = inputData[index1] || 0;
           const val2 = inputData[index2] || 0;
           downsampled[i] = val1 * (1 - weight) + val2 * weight;
       }
-      // -----------------------------------------------------------
 
-      // 원형 버퍼에 담기
       for (let i = 0; i < downsampled.length; i++) {
         circularBuffer[writeIndex] = downsampled[i];
         writeIndex = (writeIndex + 1) % bufferSize;
       }
 
-      // 분류 실행
       let linearBuffer = new Float32Array(bufferSize);
       for (let i = 0; i < bufferSize; i++) {
         linearBuffer[i] = circularBuffer[(writeIndex + i) % bufferSize];
@@ -146,26 +144,25 @@ function App() {
         let results = classifierRef.current.classify(linearBuffer);
         let top = results.results.reduce((p, c) => p.value > c.value ? p : c);
         
-        // 결과 업데이트 (0.5 이상이면 감지)
+        // 결과 처리 (사용자님 인터페이스 텍스트 반영)
         if (top.label === 'korean' && top.value > 0.5) {
              lastKoreanTime.current = Date.now();
              setMicStatus("🔊 Korean Detected!");
              setMicClass("status-box active-red");
              checkViolation();
         } else {
-             // 1.5초 동안 조용하면 다시 Listening으로
              if (Date.now() - lastKoreanTime.current > 1500) {
-                 setMicStatus("🎤 Listening..."); // Standby 대신 Listening 표시
+                 setMicStatus("🎤 Silence/English");
                  setMicClass("status-box");
              }
         }
       } catch (ex) {
-          // 분류 에러 무시
+          // 에러 무시
       }
     };
   };
 
-  // [4] 비디오 처리
+  // [4] 비디오 처리 (FaceMesh - 사용자님 코드 그대로)
   const startFaceMesh = async () => {
     const videoElement = document.getElementById('input_video');
     const canvasElement = document.getElementById('output_canvas');
@@ -191,19 +188,14 @@ function App() {
           const MOUTH_LIMIT = 5.0; 
           const isMouthOpenNow = (dist > MOUTH_LIMIT);
 
-          const vStatus = document.getElementById('status-video');
           if (isMouthOpenNow) {
               lastMouthTime.current = Date.now();
-              if(vStatus) {
-                  vStatus.innerText = `👄 ${percent.toFixed(0)}% (Open)`;
-                  vStatus.className = "status-box active-green"; 
-              }
+              setVideoStatus(`👄 ${percent.toFixed(0)}% (Open)`);
+              setVideoClass("status-box active-green");
               checkViolation();
           } else {
-              if(vStatus) {
-                  vStatus.innerText = `🤐 ${percent.toFixed(0)}% (Closed)`;
-                  vStatus.className = "status-box";
-              }
+              setVideoStatus(`🤐 ${percent.toFixed(0)}% (Closed)`);
+              setVideoClass("status-box");
           }
 
           const zoom = 4.0; const cw = sW/zoom; const ch = sH/zoom;
@@ -220,7 +212,7 @@ function App() {
     await camera.start();
   };
 
-  // [5] 위반 감지
+  // [5] 위반 감지 및 UI 동작 (사용자님 코드와 동일)
   const checkViolation = () => {
     const now = Date.now();
     if (now - lastTriggerTime.current < 5000) return; 
@@ -236,13 +228,16 @@ function App() {
   const triggerDetection = () => {
     lastTriggerTime.current = Date.now(); 
 
+    // 오버레이
     const overlay = document.getElementById('alert-overlay');
     if(overlay) {
         overlay.style.display = 'block';
+        overlay.innerText = `🚨 DETECTED!`;
+        setVideoClass("status-box active-red");
         setTimeout(() => overlay.style.display = 'none', 2000);
     }
-    
-    // 이미지 변경 로직 (사용자님 원본 반영)
+
+    // 이미지 변경 로직
     const img = document.getElementById('monitor-image');
     if(img) {
         img.src = "2.jpg"; 
@@ -255,6 +250,7 @@ function App() {
         }, 5000);
     }
 
+    // DB 전송
     const name = document.getElementById('input-name').value;
     const id = document.getElementById('input-id').value;
     if(dbRef.current) {
@@ -265,7 +261,7 @@ function App() {
     }
   };
 
-  // [6] 리스트 로드
+  // [6] 리스트 관리
   const loadList = () => {
       if(!dbRef.current) return;
       dbRef.current.collection("detections").orderBy("timestamp", "desc").onSnapshot(snapshot => {
@@ -310,10 +306,7 @@ function App() {
     });
   };
 
-  // [7] 기타 버튼
-  const toggleList = () => {
-      document.getElementById('list-panel').classList.toggle('open');
-  };
+  const toggleList = () => { document.getElementById('list-panel').classList.toggle('open'); };
 
   const authProfessor = () => {
     if (prompt("Enter Admin Password:") === "kyj") {
@@ -342,9 +335,9 @@ function App() {
     }
   };
 
-  // [8] HTML 렌더링 (사용자님 원본 HTML 100% 동일)
+  // [7] HTML 렌더링 (사용자님 원본 구조와 텍스트 100% 동일)
   return (
-    <>
+    <div className="app-container">
       <div id="sidebar">
         <div className="title-container">
             <h2>Korean Killer</h2>
@@ -386,9 +379,9 @@ function App() {
             </div>
 
             <div id="status-panel" style={{display:'none'}}>
-                {/* 여기가 핵심: React State 변수로 제어하여 화면 갱신 보장 */}
+                {/* React State로 제어되지만, 초기값은 원본 HTML과 동일 */}
                 <div id="status-audio" className={micClass}>{micStatus}</div>
-                <div id="status-video" className="status-box">🤐 0%</div>
+                <div id="status-video" className={videoClass}>{videoStatus}</div>
             </div>
 
             <div id="camera-wrapper">
@@ -397,9 +390,8 @@ function App() {
             </div>
         </div>
       </div>
-
       <video id="input_video" playsInline style={{display:'none'}}></video>
-    </>
+    </div>
   );
 }
 
